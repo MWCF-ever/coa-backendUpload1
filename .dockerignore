@@ -139,12 +139,6 @@ dmypy.json
 ehthumbs.db
 Thumbs.db
 
-# Project specific
-uploads/
-logs/
-certs/
-*.pdf
-*.log
 
 # Temporary files
 tmp/

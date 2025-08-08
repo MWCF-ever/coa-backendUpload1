@@ -68,6 +68,63 @@ async def readiness_check(db: Session = Depends(get_db)):
         }
     }
 
+@router.get("/debug/processing-status", status_code=status.HTTP_200_OK)
+async def debug_processing_status():
+    """调试 ProcessingStatus 枚举值 - 临时端点"""
+    try:
+        from ...models.document import ProcessingStatus
+        
+        # 收集枚举信息
+        enum_info = {}
+        all_lowercase = True
+        database_compatible = True
+        allowed_values = ['pending', 'processing', 'completed', 'failed']
+        
+        for status in ProcessingStatus:
+            value = status.value
+            is_lowercase = value.islower()
+            is_compatible = value in allowed_values
+            
+            enum_info[status.name] = {
+                "value": value,
+                "is_lowercase": is_lowercase,
+                "database_compatible": is_compatible,
+                "type": str(type(value))
+            }
+            
+            if not is_lowercase:
+                all_lowercase = False
+            if not is_compatible:
+                database_compatible = False
+        
+        return {
+            "status": "success",
+            "timestamp": datetime.utcnow().isoformat(),
+            "enum_values": enum_info,
+            "summary": {
+                "all_lowercase": all_lowercase,
+                "database_compatible": database_compatible,
+                "total_statuses": len(enum_info)
+            },
+            "database_constraint": {
+                "expected_values": allowed_values,
+                "constraint_type": "CHECK (processing_status IN ('pending', 'processing', 'completed', 'failed'))"
+            },
+            "recommendations": {
+                "problem_detected": not (all_lowercase and database_compatible),
+                "fix_needed": "Enum values must be lowercase to match database constraint" if not all_lowercase else None
+            }
+        }
+        
+    except Exception as e:
+        import traceback
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
 @router.get("/live", status_code=status.HTTP_200_OK)
 async def liveness_check():
     """Simple liveness check for container orchestration"""

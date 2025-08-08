@@ -9,6 +9,8 @@ import aiofiles
 from datetime import datetime
 import hashlib
 import json
+import requests
+from pathlib import Path
 
 from ...database import get_db
 from ...config import settings
@@ -313,6 +315,69 @@ async def get_cache_status(
 
 # ============ 增强的主要处理端点 ============
 
+async def download_pdfs_if_needed():
+    """
+    如果 uploads/pdfs 目录为空，从前端下载 PDF 文件
+    这是一个一次性的解决方案
+    """
+    pdf_directory = getattr(settings, 'PDF_DIRECTORY', settings.UPLOAD_DIR + '/pdfs')
+    
+    # 检查目录是否存在且为空
+    if not os.path.exists(pdf_directory):
+        os.makedirs(pdf_directory, exist_ok=True)
+    
+    existing_pdfs = glob.glob(os.path.join(pdf_directory, "*.pdf"))
+    
+    # 如果已有 PDF 文件，跳过下载
+    if existing_pdfs:
+        print(f"📄 目录中已有 {len(existing_pdfs)} 个 PDF 文件，跳过下载")
+        return
+    
+    print("📥 检测到 PDF 目录为空，开始从前端下载文件...")
+    
+    # 前端 PDF 文件的 URL 列表（需要根据你的实际前端地址修改）
+    frontend_base_url = "https://beone-d.beigenecorp.net/aimta/assets/pdfs"  # 修改为你的前端地址
+    
+    pdf_files = [
+        "BGNE_GQA_BGB-16673_DS_CR-C200727003-FPF24001_COA-US.pdf",
+        "BGNE_GQA_BGB-16673_DS_CR-C200727003-FPF24002_COA-US.pdf", 
+        "BGNE_GQA_BGB-16673_DS_CR-C200727003-FPF24003_COA-US.pdf",
+        "BGNE_GQA_BGB-16673_DS_CR-C200727003-FPF24004_COA-US.pdf",
+        "BGNE_ESQ_BGB-16673_DS_CM-C200727003-FPF25101_COA-US.pdf"
+    ]
+    
+    downloaded_count = 0
+    
+    for pdf_filename in pdf_files:
+        try:
+            pdf_url = f"{frontend_base_url}/{pdf_filename}"
+            local_path = os.path.join(pdf_directory, pdf_filename)
+            
+            print(f"📥 下载: {pdf_filename}")
+            
+            response = requests.get(pdf_url, timeout=30)
+            response.raise_for_status()
+            
+            # 验证是否是有效的 PDF 文件
+            if not response.content.startswith(b'%PDF'):
+                print(f"⚠️  {pdf_filename} 不是有效的 PDF 文件，跳过")
+                continue
+            
+            # 保存文件
+            with open(local_path, 'wb') as f:
+                f.write(response.content)
+            
+            file_size = len(response.content)
+            print(f"✅ {pdf_filename} 下载成功 ({file_size} bytes)")
+            downloaded_count += 1
+            
+        except requests.RequestException as e:
+            print(f"❌ 下载 {pdf_filename} 失败: {e}")
+        except Exception as e:
+            print(f"❌ 保存 {pdf_filename} 失败: {e}")
+    
+    print(f"📊 下载完成: {downloaded_count}/{len(pdf_files)} 个文件")
+
 @router.post("/process-directory", response_model=ApiResponse)
 async def process_directory(
     request: DirectoryProcessRequest,  # 所有参数都通过 JSON body 传递
@@ -320,6 +385,7 @@ async def process_directory(
 ):
     """Process all PDF files in the specified directory and extract batch analysis data"""
     try:
+        await download_pdfs_if_needed()
         # 从 request 对象获取参数
         force_reprocess = getattr(request, 'force_reprocess', False)
         
@@ -430,13 +496,13 @@ async def process_directory(
                         print(f"⚠️  Document already exists: {filename}, skipping...")
                         continue
                     
-                    # 创建数据库记录
+                    # 创建数据库记录 - 修复：使用 ProcessingStatus.PROCESSING.value
                     document = COADocument(
                         compound_id=UUID(request.compound_id),
                         filename=filename,
                         file_path=pdf_file,
                         file_size=f"{os.path.getsize(pdf_file) / 1024:.2f} KB",
-                        processing_status=ProcessingStatus.PROCESSING.value
+                        processing_status=ProcessingStatus.PROCESSING.value  # 修复：使用枚举值而不是硬编码字符串
                     )
                     
                     db.add(document)
@@ -458,8 +524,8 @@ async def process_directory(
                     # 验证和清理数据
                     batch_data = ai_extractor.validate_batch_data(batch_data)
                     
-                    # 更新文档状态
-                    document.processing_status = ProcessingStatus.COMPLETED.value
+                    # 更新文档状态 - 修复：使用 ProcessingStatus.COMPLETED.value
+                    document.processing_status = ProcessingStatus.COMPLETED.value  # 修复：使用枚举值
                     document.processed_at = datetime.utcnow()
                     
                     # 保存提取的批次数据
@@ -529,7 +595,8 @@ async def process_directory(
                                 COADocument.id == document.id
                             ).first()
                             if fail_doc:
-                                fail_doc.processing_status = ProcessingStatus.FAILED.value
+                                # 修复：使用 ProcessingStatus.FAILED.value
+                                fail_doc.processing_status = ProcessingStatus.FAILED.value  # 修复：使用枚举值
                                 fail_doc.error_message = error_msg[:500]  # 限制错误消息长度
                         db.commit()
                     except Exception as update_error:
@@ -618,10 +685,10 @@ async def get_batch_analysis_data(
 ):
     """Get all batch analysis data for a compound"""
     try:
-        # 获取该化合物的所有文档
+        # 获取该化合物的所有文档 - 修复：使用 ProcessingStatus.COMPLETED.value
         documents = db.query(COADocument).filter(
             COADocument.compound_id == compound_id,
-            COADocument.processing_status == ProcessingStatus.COMPLETED.value
+            COADocument.processing_status == ProcessingStatus.COMPLETED.value  # 修复：使用枚举值
         ).all()
         
         if not documents:
@@ -700,12 +767,13 @@ async def upload_document(
         
         file_path = await file_manager.save_upload(file, compound_id)
         
+        # 修复：使用 ProcessingStatus.PENDING.value
         document = COADocument(
             compound_id=UUID(compound_id),
             filename=file.filename,
             file_path=file_path,
             file_size=f"{file.size / 1024:.2f} KB",
-            processing_status=ProcessingStatus.PENDING.value
+            processing_status=ProcessingStatus.PENDING.value  # 修复：使用枚举值而不是硬编码字符串
         )
         
         db.add(document)

@@ -55,6 +55,13 @@ COPY --from=build-stage /src/alembic.ini /app/
 COPY --from=build-stage /src/run.py /app/
 COPY --from=build-stage /src/.env.example /app/
 
+# ---------- 重要：拷贝测试 PDF 文件 ----------
+# 如果有测试 PDF 文件，确保它们被包含
+COPY --from=build-stage /src/uploads /app/uploads
+
+# 或者，如果你有专门的测试数据目录
+# COPY --from=build-stage /src/test_data /app/test_data
+
 # ---------- 运行环境变量 ----------
 ENV PYTHONPATH=/app
 ENV UVICORN_HOST="0.0.0.0"
@@ -101,6 +108,10 @@ RUN pip install --no-cache-dir --upgrade pip \
 # ---- 拷贝源码（开发态需要原始代码和测试文件）----
 USER ${USER}
 COPY . /app
+
+# ---- 确保测试 PDF 文件在开发环境中可用 ----
+# 在开发环境中，所有文件都会被拷贝，包括 uploads 目录
+
 ENV PYTHONPATH=/app
 ENV DEBUG="True"
 ENV SSL_ENABLED="False"
