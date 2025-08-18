@@ -162,8 +162,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
 ## API Documentation
 
 Once the server is running, access the interactive API documentation at:
-- Swagger UI: `http://localhost:8000/api/docs`
-- ReDoc: `http://localhost:8000/api/redoc`
+- Swagger UI: `https://localhost:8000/api/docs`
+- ReDoc: `https://localhost:8000/api/redoc`
 
 ## API Endpoints
 

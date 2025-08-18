@@ -1,13 +1,14 @@
+# docker-compose.yml - Updated with Veeva support
 version: '3.8'
 
 services:
-  # COA Backend API
+  # COA Backend API with Veeva Integration
   coa-backend:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        TARGET: ${TARGET:-prod}  # 默认为 prod，可通过环境变量覆盖
+        TARGET: ${TARGET:-prod}
     container_name: coa-backend-api
     ports:
       - "${API_PORT:-8000}:8000"
@@ -23,10 +24,10 @@ services:
       SSL_ENABLED: "${SSL_ENABLED:-False}"
       
       # Database Configuration
-      DB_HOST: "${DB_HOST:-uw2-dataexe-db-d.cijvcub5gps8.us-west-2.rds.amazonaws.com}"
+      DB_HOST: "${DB_HOST:-bg-beone-db-d-1.cijvcub5gps8.us-west-2.rds.amazonaws.com}"
       DB_PORT: "${DB_PORT:-5432}"
-      DB_NAME: "${DB_NAME:-gps}"
-      DB_USER: "${DB_USER:-gps_dev_owner}"
+      DB_NAME: "${DB_NAME:-aimta}"
+      DB_USER: "${DB_USER:-aimta_dev_owner}"
       DB_PASSWORD: "${DB_PASSWORD}"
       DB_SCHEMA: "${DB_SCHEMA:-coa_processor}"
       
@@ -35,6 +36,22 @@ services:
       AZURE_OPENAI_BASE_URL: "${AZURE_OPENAI_BASE_URL:-https://dsdi-openai-dev.openai.azure.com/}"
       AZURE_OPENAI_API_VERSION: "${AZURE_OPENAI_API_VERSION:-2025-01-01-preview}"
       AZURE_OPENAI_DEPLOYMENT_NAME: "${AZURE_OPENAI_DEPLOYMENT_NAME:-dsdi-gpt-4o}"
+      
+      # Veeva Vault Configuration
+      VEEVA_VAULT_URL: "${VEEVA_VAULT_URL:-https://sb-beigene-rim.veevavault.com}"
+      VEEVA_USERNAME: "${VEEVA_USERNAME:-zhijun.li@sb-beigene.com}"
+      VEEVA_PASSWORD: "${VEEVA_PASSWORD}"  # Must be set via environment variable
+      VEEVA_API_VERSION: "${VEEVA_API_VERSION:-v25.1}"
+      VEEVA_API_TIMEOUT: "${VEEVA_API_TIMEOUT:-30}"
+      VEEVA_MAX_CONCURRENT_DOWNLOADS: "${VEEVA_MAX_CONCURRENT_DOWNLOADS:-3}"
+      VEEVA_DOWNLOAD_CHUNK_SIZE: "${VEEVA_DOWNLOAD_CHUNK_SIZE:-8192}"
+      VEEVA_ENABLED: "${VEEVA_ENABLED:-True}"
+      
+      # Processing Configuration
+      PROCESSING_MODE: "${PROCESSING_MODE:-hybrid}"
+      MAX_MEMORY_PDF_SIZE: "${MAX_MEMORY_PDF_SIZE:-52428800}"
+      ENABLE_CACHE: "${ENABLE_CACHE:-True}"
+      CACHE_TTL: "${CACHE_TTL:-3600}"
       
       # OpenAI (fallback)
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
@@ -69,8 +86,15 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    # Resource limits for memory management
+    deploy:
+      resources:
+        limits:
+          memory: 2G  # Limit container to 2GB RAM
+        reservations:
+          memory: 512M  # Reserve at least 512MB
 
-  # Redis for caching (optional)
+  # Redis for caching (optional but recommended for Veeva integration)
   redis:
     image: redis:7-alpine
     container_name: coa-redis
@@ -81,7 +105,7 @@ services:
     networks:
       - coa-network
     restart: unless-stopped
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 30s
@@ -104,7 +128,7 @@ services:
     depends_on:
       - coa-backend
     profiles:
-      - with-nginx  # 使用 --profile with-nginx 启动
+      - with-nginx
 
 volumes:
   coa_uploads:

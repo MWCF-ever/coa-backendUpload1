@@ -1,3 +1,4 @@
+# app/api/v1/documents.py - Enhanced with Veeva Integration
 from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile, Form, Query
 from sqlalchemy.orm import Session
 from typing import Optional, List, Dict, Any
@@ -11,20 +12,28 @@ import hashlib
 import json
 import requests
 from pathlib import Path
+import io
+import gc  # For garbage collection
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import logging
 
 from ...database import get_db
 from ...config import settings
 from ...models.document import COADocument, ProcessingStatus
 from ...models.extracted_data import ExtractedData
 from ...schemas.document import (
-    DirectoryProcessRequest
+    DirectoryProcessRequest,
+    VeevaProcessRequest  # New schema for Veeva processing
 )
 from ...schemas.extracted_data import ProcessingResultResponse, ApiResponse
 from ...services.file_manager import FileManager
 from ...services.pdf_processor import PDFProcessor
 from ...services.ai_extractor import AIExtractor
+from ...services.veeva_service import VeevaService, VeevaAPIError  # New Veeva service
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # Initialize services
 file_manager = FileManager(settings.UPLOAD_DIR)
@@ -43,7 +52,7 @@ class BatchDataCache:
         """创建缓存表（如果不存在）"""
         try:
             self.db.execute(text("""
-                CREATE TABLE IF NOT EXISTS batch_data_cache (
+                CREATE TABLE IF NOT EXISTS coa_processor.batch_data_cache (
                     id SERIAL PRIMARY KEY,
                     compound_id VARCHAR(255) NOT NULL,
                     template_id VARCHAR(255) NOT NULL,
@@ -57,7 +66,7 @@ class BatchDataCache:
                 );
                 
                 CREATE INDEX IF NOT EXISTS idx_batch_cache_compound_template 
-                ON batch_data_cache(compound_id, template_id);
+                ON coa_processor.batch_data_cache(compound_id, template_id);
             """))
             self.db.commit()
         except Exception as e:
@@ -70,7 +79,7 @@ def get_cache_record(db: Session, compound_id: str, template_id: str) -> Optiona
         result = db.execute(
             text("""
             SELECT batch_data, updated_at, total_files, processed_files, file_hashes
-            FROM batch_data_cache 
+            FROM coa_processor.batch_data_cache 
             WHERE compound_id = :compound_id AND template_id = :template_id
             """),
             {"compound_id": compound_id, "template_id": template_id}
@@ -98,7 +107,7 @@ def update_cache_record(db: Session, compound_id: str, template_id: str,
         # 先尝试更新
         result = db.execute(
             text("""
-            UPDATE batch_data_cache 
+            UPDATE coa_processor.batch_data_cache 
             SET batch_data = :batch_data, file_hashes = :file_hashes, 
                 total_files = :total_files, processed_files = :processed_files, 
                 updated_at = :updated_at
@@ -119,7 +128,7 @@ def update_cache_record(db: Session, compound_id: str, template_id: str,
         if result.rowcount == 0:
             db.execute(
                 text("""
-                INSERT INTO batch_data_cache 
+                INSERT INTO coa_processor.batch_data_cache 
                 (compound_id, template_id, batch_data, file_hashes, total_files, 
                  processed_files, created_at, updated_at)
                 VALUES (:compound_id, :template_id, :batch_data, :file_hashes, 
@@ -149,7 +158,7 @@ def delete_cache_record(db: Session, compound_id: str, template_id: str) -> int:
     try:
         result = db.execute(
             text("""
-            DELETE FROM batch_data_cache 
+            DELETE FROM coa_processor.batch_data_cache 
             WHERE compound_id = :compound_id AND template_id = :template_id
             """),
             {"compound_id": compound_id, "template_id": template_id}
@@ -176,6 +185,409 @@ def calculate_file_hashes(pdf_directory: str) -> List[str]:
     except Exception as e:
         print(f"计算文件哈希失败: {e}")
     return sorted(hashes)  # 排序以保证一致性
+
+
+
+
+
+# ============ NEW: Veeva Integration Functions ============
+
+async def process_veeva_document_stream(
+    pdf_stream: io.BytesIO,
+    document_id: str,
+    metadata: Dict,
+    compound_id: UUID,
+    db: Session
+) -> Dict:
+    """
+    Process a single PDF document from Veeva stream
+    
+    Args:
+        pdf_stream: BytesIO containing PDF data
+        document_id: Veeva document ID
+        metadata: Document metadata from Veeva
+        compound_id: Compound ID for database
+        db: Database session
+    
+    Returns:
+        Dictionary with processing results
+    """
+    document = None
+    
+    try:
+        # Create filename from metadata
+        doc_name = metadata.get('name__v', document_id)
+        doc_version = f"{metadata.get('major_version_number__v', 1)}.{metadata.get('minor_version_number__v', 0)}"
+        filename = f"{doc_name}_v{doc_version}.pdf"
+        
+        logger.info(f"📄 Processing Veeva document: {filename} (ID: {document_id})")
+        
+        # Check if document already exists
+        existing_doc = db.query(COADocument).filter(
+            COADocument.filename == filename,
+            COADocument.compound_id == compound_id
+        ).first()
+        
+        if existing_doc:
+            logger.warning(f"⚠️ Document already exists: {filename}, skipping...")
+            return {
+                "status": "skipped",
+                "filename": filename,
+                "document_id": document_id,
+                "message": "Document already processed"
+            }
+        
+        # Create database record
+        document = COADocument(
+            compound_id=compound_id,
+            filename=filename,
+            file_path=f"veeva://{document_id}",  # Virtual path for Veeva documents
+            file_size=f"{metadata.get('downloaded_size', 0) / 1024:.2f} KB",
+            processing_status=ProcessingStatus.PROCESSING.value
+        )
+        
+        db.add(document)
+        db.flush()  # Get ID but don't commit yet
+        
+        # Extract PDF text from stream
+        logger.info("📖 Extracting text from PDF stream...")
+        pdf_text = await pdf_processor.extract_text_from_stream(pdf_stream)
+        
+        if not pdf_text.strip():
+            raise Exception("No text content found in PDF")
+        
+        logger.info(f"✅ Extracted {len(pdf_text)} characters of text")
+        
+        # Use AI to extract batch data
+        logger.info("🔍 Extracting COA batch analysis data...")
+        batch_data = await ai_extractor.extract_coa_batch_data(pdf_text, filename)
+        
+        # Validate and clean data
+        batch_data = ai_extractor.validate_batch_data(batch_data)
+        
+        # Update document status
+        document.processing_status = ProcessingStatus.COMPLETED.value
+        document.processed_at = datetime.utcnow()
+        
+        # Save extracted batch data
+        batch_number = batch_data.get('batch_number', '')
+        manufacture_date = batch_data.get('manufacture_date', '')
+        manufacturer = batch_data.get('manufacturer', '')
+        
+        # Save basic batch information
+        basic_fields = [
+            ('batch_number', batch_number),
+            ('manufacture_date', manufacture_date),
+            ('manufacturer', manufacturer)
+        ]
+        
+        for field_name, field_value in basic_fields:
+            if field_value:
+                data = ExtractedData(
+                    document_id=document.id,
+                    field_name=field_name,
+                    field_value=field_value,
+                    confidence_score=0.95,
+                    original_text=field_value
+                )
+                db.add(data)
+        
+        # Save test results data
+        test_results = batch_data.get('test_results', {})
+        for test_param, result_value in test_results.items():
+            if result_value and result_value not in ['TBD', '']:
+                data = ExtractedData(
+                    document_id=document.id,
+                    field_name=test_param,
+                    field_value=result_value,
+                    confidence_score=0.90,
+                    original_text=result_value
+                )
+                db.add(data)
+        
+        # Commit transaction
+        db.commit()
+        
+        # Add Veeva-specific metadata to batch data
+        batch_data['veeva_document_id'] = document_id
+        batch_data['veeva_version'] = doc_version
+        
+        logger.info(f"✅ Successfully processed Veeva document: {filename}")
+        
+        return {
+            "status": "success",
+            "filename": filename,
+            "document_id": document_id,
+            "batch_data": batch_data
+        }
+        
+    except Exception as e:
+        # Rollback transaction
+        db.rollback()
+        
+        error_msg = str(e)
+        logger.error(f"❌ Error processing Veeva document {document_id}: {error_msg}")
+        
+        # Update document status if it was created
+        if document and document.id:
+            try:
+                fail_doc = db.query(COADocument).filter(
+                    COADocument.id == document.id
+                ).first()
+                if fail_doc:
+                    fail_doc.processing_status = ProcessingStatus.FAILED.value
+                    fail_doc.error_message = error_msg[:500]
+                    db.commit()
+            except Exception as update_error:
+                logger.error(f"Failed to update document status: {update_error}")
+                db.rollback()
+        
+        return {
+            "status": "failed",
+            "filename": filename if 'filename' in locals() else document_id,
+            "document_id": document_id,
+            "error": error_msg
+        }
+    finally:
+        # Clean up memory
+        if pdf_stream:
+            pdf_stream.close()
+            del pdf_stream
+        gc.collect()
+
+# ============ NEW: Veeva Processing Endpoint ============
+
+@router.post("/process-from-veeva", response_model=ApiResponse)
+async def process_from_veeva(
+    request: VeevaProcessRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Process COA documents directly from Veeva Vault
+    
+    This endpoint:
+    1. Receives a list of Veeva document IDs
+    2. Downloads each document as a stream from Veeva
+    3. Processes them in memory without saving to disk
+    4. Extracts batch analysis data
+    5. Stores results in database
+    """
+    
+    if not settings.VEEVA_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Veeva integration is not enabled"
+        )
+    
+    try:
+        print(f"\n{'='*80}")
+        print(f"🚀 VEEVA COA BATCH ANALYSIS PROCESSING STARTED")
+        print(f"{'='*80}")
+        print(f"📋 Document IDs: {request.document_ids}")
+        print(f"🧬 Compound ID: {request.compound_id}")
+        print(f"📋 Template ID: {request.template_id}")
+        print(f"🔄 Force reprocess: {request.force_reprocess}")
+        
+        # Initialize cache manager
+        cache_manager = BatchDataCache(db)
+        
+        # Check cache if not forcing reprocess
+        if not request.force_reprocess and settings.ENABLE_CACHE:
+            # Create a hash of document IDs for cache key
+            doc_ids_hash = hashlib.md5(
+                ",".join(sorted(request.document_ids)).encode()
+            ).hexdigest()
+            
+            cache_data = get_cache_record(db, request.compound_id, request.template_id)
+            
+            if cache_data:
+                # Check if same documents
+                cached_hashes = cache_data.get("fileHashes", [])
+                if doc_ids_hash in cached_hashes:
+                    print(f"✅ Cache hit! Returning cached data")
+                    return ApiResponse(
+                        success=True,
+                        data={
+                            "processedFiles": cache_data.get("processedFiles", []),
+                            "failedFiles": [],
+                            "totalFiles": cache_data.get("totalFiles", 0),
+                            "batchData": cache_data["batchData"],
+                            "status": "success",
+                            "fromCache": True,
+                            "source": "veeva",
+                            "message": f"Loaded from cache (last updated: {cache_data['lastUpdated']})"
+                        }
+                    )
+        
+        # Initialize Veeva service
+        veeva_service = VeevaService()
+        
+        # Test connection
+        if not veeva_service.test_connection():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Failed to connect to Veeva Vault"
+            )
+        
+        print(f"✅ Connected to Veeva Vault successfully")
+        
+        batch_data_list = []
+        processed_files = []
+        failed_files = []
+        
+        # Process documents concurrently
+        tasks = []
+        
+        for doc_id in request.document_ids:
+            try:
+                print(f"\n📥 Downloading from Veeva: {doc_id}")
+                
+                # Download document from Veeva
+                pdf_stream, metadata = veeva_service.download_document_as_stream(doc_id)
+                
+                # Process the document stream
+                result = await process_veeva_document_stream(
+                    pdf_stream=pdf_stream,
+                    document_id=doc_id,
+                    metadata=metadata,
+                    compound_id=UUID(request.compound_id),
+                    db=db
+                )
+                
+                if result["status"] == "success":
+                    batch_data_list.append(result["batch_data"])
+                    processed_files.append(result["filename"])
+                elif result["status"] == "skipped":
+                    print(f"⏭️ Skipped: {result['message']}")
+                else:
+                    failed_files.append({
+                        "document_id": doc_id,
+                        "filename": result.get("filename", doc_id),
+                        "error": result.get("error", "Unknown error")
+                    })
+                    
+            except VeevaAPIError as e:
+                logger.error(f"❌ Veeva API error for {doc_id}: {e}")
+                failed_files.append({
+                    "document_id": doc_id,
+                    "filename": doc_id,
+                    "error": str(e)
+                })
+            except Exception as e:
+                logger.error(f"❌ Unexpected error for {doc_id}: {e}")
+                failed_files.append({
+                    "document_id": doc_id,
+                    "filename": doc_id,
+                    "error": str(e)
+                })
+        
+        # Close Veeva service
+        veeva_service.close()
+        
+        # Update cache if processing was successful
+        if batch_data_list and settings.ENABLE_CACHE:
+            try:
+                doc_ids_hash = hashlib.md5(
+                    ",".join(sorted(request.document_ids)).encode()
+                ).hexdigest()
+                
+                update_cache_record(
+                    db, request.compound_id, request.template_id,
+                    batch_data_list, [doc_ids_hash], processed_files
+                )
+                print(f"✅ Cache updated successfully")
+            except Exception as e:
+                print(f"⚠️ Cache update failed: {e}")
+        
+        # Summary
+        print(f"\n{'='*80}")
+        print(f"📈 VEEVA PROCESSING SUMMARY")
+        print(f"{'='*80}")
+        print(f"📄 Total documents requested: {len(request.document_ids)}")
+        print(f"✅ Successfully processed: {len(processed_files)}")
+        print(f"❌ Failed: {len(failed_files)}")
+        print(f"📊 Total batches analyzed: {len(batch_data_list)}")
+        
+        if failed_files:
+            print(f"\n❌ Failed documents:")
+            for failed in failed_files:
+                print(f"   • {failed['document_id']}: {failed['error']}")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                "processedFiles": processed_files,
+                "failedFiles": failed_files,
+                "totalFiles": len(request.document_ids),
+                "batchData": batch_data_list,
+                "status": "success" if processed_files else "failed",
+                "fromCache": False,
+                "source": "veeva",
+                "message": f"Processed {len(batch_data_list)} batches from Veeva"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"❌ Veeva processing failed: {error_msg}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+
+# ============ Hybrid Processing Endpoint ============
+
+@router.post("/process-hybrid", response_model=ApiResponse)
+async def process_hybrid(
+    request: Dict[str, Any],
+    db: Session = Depends(get_db)
+):
+    """
+    Hybrid processing endpoint that can handle both local files and Veeva documents
+    
+    Request format:
+    {
+        "compound_id": "uuid",
+        "template_id": "uuid",
+        "source": "local" | "veeva" | "auto",
+        "document_ids": ["VV-QDOC-xxx", ...],  // For Veeva
+        "directory_path": "/path/to/pdfs",     // For local
+        "force_reprocess": false
+    }
+    """
+    
+    source = request.get("source", "auto")
+    
+    if source == "veeva" or (source == "auto" and request.get("document_ids")):
+        # Process from Veeva
+        veeva_request = VeevaProcessRequest(
+            compound_id=request["compound_id"],
+            template_id=request["template_id"],
+            document_ids=request["document_ids"],
+            force_reprocess=request.get("force_reprocess", False)
+        )
+        return await process_from_veeva(veeva_request, db)
+        
+    elif source == "local" or (source == "auto" and request.get("directory_path")):
+        # Process from local directory
+        dir_request = DirectoryProcessRequest(
+            compound_id=request["compound_id"],
+            template_id=request["template_id"],
+            directory_path=request.get("directory_path"),
+            force_reprocess=request.get("force_reprocess", False)
+        )
+        return await process_directory(dir_request, db)
+        
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid request: must specify either document_ids for Veeva or directory_path for local processing"
+        )
+
 
 # ============ 新增缓存API端点 ============
 
@@ -267,12 +679,12 @@ async def get_cache_status(
                     COUNT(*) as total_records,
                     MAX(updated_at) as last_updated,
                     SUM(total_files) as total_files
-                FROM batch_data_cache
+                FROM coa_processor.batch_data_cache
             """)).fetchone()
             
             cache_records = db.execute(text("""
                 SELECT compound_id, template_id, total_files, updated_at
-                FROM batch_data_cache
+                FROM coa_processor.batch_data_cache
                 ORDER BY updated_at DESC
                 LIMIT 10
             """)).fetchall()
@@ -311,6 +723,88 @@ async def get_cache_status(
         return ApiResponse(
             success=False,
             error=f"Failed to get cache status: {str(e)}"
+        )
+    
+@router.get("/debug-directory", response_model=ApiResponse)
+async def debug_directory_info(
+    compound_id: str = Query(...),
+    template_id: str = Query(...),
+    db: Session = Depends(get_db)
+):
+    """调试端点：检查PDF目录和文件状态"""
+    try:
+        debug_info = {}
+        
+        # 1. 检查PDF目录配置
+        pdf_directory = getattr(settings, 'PDF_DIRECTORY', settings.UPLOAD_DIR)
+        debug_info['pdf_directory'] = pdf_directory
+        debug_info['directory_exists'] = os.path.exists(pdf_directory)
+        
+        # 2. 检查目录内容
+        if os.path.exists(pdf_directory):
+            all_files = os.listdir(pdf_directory)
+            pdf_files = glob.glob(os.path.join(pdf_directory, "*.pdf"))
+            debug_info['all_files'] = all_files
+            debug_info['pdf_files'] = [os.path.basename(f) for f in pdf_files]
+            debug_info['pdf_count'] = len(pdf_files)
+            
+            # 3. 检查PDF文件详情
+            pdf_details = []
+            for pdf_file in pdf_files[:3]:  # 只检查前3个文件
+                try:
+                    stat = os.stat(pdf_file)
+                    # 尝试提取文本
+                    text_sample = await pdf_processor.extract_text(pdf_file)
+                    
+                    pdf_details.append({
+                        'filename': os.path.basename(pdf_file),
+                        'size_kb': round(stat.st_size / 1024, 2),
+                        'modified': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                        'text_length': len(text_sample),
+                        'text_preview': text_sample[:200] + "..." if len(text_sample) > 200 else text_sample,
+                        'can_extract_text': len(text_sample.strip()) > 0
+                    })
+                except Exception as e:
+                    pdf_details.append({
+                        'filename': os.path.basename(pdf_file),
+                        'error': str(e)
+                    })
+            
+            debug_info['pdf_details'] = pdf_details
+        else:
+            debug_info['all_files'] = []
+            debug_info['pdf_files'] = []
+            debug_info['pdf_count'] = 0
+            debug_info['pdf_details'] = []
+        
+        # 4. 检查AI服务配置
+        ai_config = {
+            'use_azure_openai': getattr(settings, 'USE_AZURE_OPENAI', False),
+            'azure_deployment': getattr(settings, 'AZURE_OPENAI_DEPLOYMENT_NAME', None),
+            'has_openai_key': bool(getattr(settings, 'OPENAI_API_KEY', None)),
+            'test_parameters_count': len(ai_extractor.get_test_parameters())
+        }
+        debug_info['ai_config'] = ai_config
+        
+        # 5. 检查缓存状态
+        cache_data = get_cache_record(db, compound_id, template_id)
+        debug_info['cache_exists'] = cache_data is not None
+        if cache_data:
+            debug_info['cache_info'] = {
+                'batch_count': len(cache_data.get('batchData', [])),
+                'last_updated': cache_data.get('lastUpdated'),
+                'file_hashes_count': len(cache_data.get('fileHashes', []))
+            }
+        
+        return ApiResponse(
+            success=True,
+            data=debug_info
+        )
+        
+    except Exception as e:
+        return ApiResponse(
+            success=False,
+            error=f"Debug failed: {str(e)}"
         )
 
 # ============ 增强的主要处理端点 ============

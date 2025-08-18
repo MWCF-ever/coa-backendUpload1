@@ -104,21 +104,21 @@ app.include_router(
     compounds.router,
     prefix="/compounds", 
     tags=["compounds"],
-    dependencies=[Depends(require_authentication)]
+    dependencies=[Depends(optional_authentication)]
 )
 
 app.include_router(
     templates.router,
     prefix="/templates",
     tags=["templates"],
-    dependencies=[Depends(require_authentication)]
+    dependencies=[Depends(optional_authentication)]
 )
 
 app.include_router(
     documents.router,
     prefix="/documents",
     tags=["documents"],
-    dependencies=[Depends(require_authentication)]
+    dependencies=[Depends(optional_authentication)]
 )
 
 # Root endpoint
@@ -167,7 +167,7 @@ async def check_auth_status(user: User = Depends(optional_authentication)):
 @app.get("/test-connection", tags=["test"])
 async def test_connection_authenticated(
     request: Request, 
-    user: User = Depends(require_authentication)
+    user: User = Depends(optional_authentication)
 ):
     """需要认证的连接测试端点"""
     return {
@@ -185,7 +185,7 @@ async def test_connection_authenticated(
 
 # 用户信息端点
 @app.get("/user/me", tags=["user"])
-async def get_current_user_info(user: User = Depends(require_authentication)):
+async def get_current_user_info(user: User = Depends(optional_authentication)):
     """获取当前用户信息"""
     return {
         "success": True,

@@ -1,3 +1,4 @@
+# app/config.py
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
@@ -51,6 +52,22 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = "gpt-4-vision-preview"
     OPENAI_MAX_TOKENS: int = 4096
     
+    # Veeva Vault Configuration
+    VEEVA_VAULT_URL: str = "https://sb-beigene-rim.veevavault.com"
+    VEEVA_USERNAME: str = "zhijun.li@sb-beigene.com"
+    VEEVA_PASSWORD: str = "Aimta2025123!"  # Will be set from environment variable
+    VEEVA_API_VERSION: str = "v25.1"
+    VEEVA_API_TIMEOUT: int = 30  # seconds
+    VEEVA_MAX_CONCURRENT_DOWNLOADS: int = 3  # Maximum concurrent downloads
+    VEEVA_DOWNLOAD_CHUNK_SIZE: int = 8192  # 8KB chunks for streaming
+    VEEVA_ENABLED: bool = True  # Enable/disable Veeva integration
+    
+    # Processing Configuration
+    PROCESSING_MODE: str = "hybrid"  # "local", "veeva", or "hybrid"
+    MAX_MEMORY_PDF_SIZE: int = 50 * 1024 * 1024  # 50MB - max size for in-memory processing
+    ENABLE_CACHE: bool = True  # Enable caching for Veeva documents
+    CACHE_TTL: int = 3600  # Cache TTL in seconds (1 hour)
+    
     # Security
     SECRET_KEY: str = "your-secret-key-here-change-in-production"
     ALGORITHM: str = "HS256"
@@ -70,6 +87,21 @@ class Settings(BaseSettings):
         if isinstance(v, bool):
             return v
         return v.lower() in ("true", "1", "yes")
+    
+    @field_validator("VEEVA_ENABLED", mode="before")
+    @classmethod
+    def parse_veeva_enabled(cls, v):
+        if isinstance(v, bool):
+            return v
+        return v.lower() in ("true", "1", "yes")
+    
+    @field_validator("PROCESSING_MODE", mode="before")
+    @classmethod
+    def validate_processing_mode(cls, v):
+        valid_modes = ["local", "veeva", "hybrid"]
+        if v not in valid_modes:
+            raise ValueError(f"PROCESSING_MODE must be one of {valid_modes}")
+        return v
     
     model_config = SettingsConfigDict(
         env_file=".env",
